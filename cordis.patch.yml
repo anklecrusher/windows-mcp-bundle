@@ -1,0 +1,96 @@
+# Windows-MCP as a computer-use plugin, bridged by the shipped
+# @deepseek-ai/dsh-mcp-client.
+#
+# This bundle is configuration-only: the manifest above declares no Host/Client
+# entry files, only `dsh.bundle.patch`. Everything it needs already ships with
+# the harness, so there is no dependency block and nothing to compile.
+#
+# Why the native MCP client and NOT dsh-mcp-lazy:
+#   dsh-mcp-lazy renders every image block as one line of text
+#   ("[image: image/png, N bytes — this gateway returns text only ...]"), and
+#   enabling its directTools promotion does not help: the promoted tools still
+#   call renderToolResult(), whose output schema is fixed to { type: 'string' }.
+#   Screenshot is the core of computer use, so routing it through that gateway
+#   would neuter the plugin. The native client runs the full image admission
+#   chain (containsImage -> decodeImage -> resolveImageAdmission ->
+#   attachments.saveImages), which is what puts real pixels in the conversation.
+#
+# Model requirement: the active route must declare image input. The live profile
+# declares `input: [text, image]` for deepseek-v4.1-flash, so admission passes.
+# On a text-only route the image degrades to a text diagnostic instead of
+# failing the call.
+#
+# Tool names become mcp__winmcp__<name>, e.g. mcp__winmcp__Screenshot.
+#
+# Python: a dedicated conda env, NOT the machine default. windows-mcp 0.8.8
+# requires Python >= 3.14 (0.8.6+ dropped 3.13), and 3.14 is what unlocks the
+# control-takeover protection this file exists to keep. Verified: every one of
+# the 17 dependencies ships a cp314 wheel, so nothing compiles at install time.
+# The interpreter is invoked by absolute path and needs no activation — pywin32
+# registers its DLLs through pywin32.pth, which is independent of PATH.
+#
+# The 12-tool allowlist is deliberate. `--tools` is the upstream server's own
+# switch, so the excluded tools are never even described to the model:
+#   dropped: PowerShell, Registry, FileSystem, Process, Scrape
+#   reason:  the harness already ships bash/pwsh/read for all of those, and
+#            registering a second, far more powerful path makes the model pick
+#            the wrong one. Windows-MCP's PowerShell tool is genuine
+#            whole-machine control (its README: "full system access and can
+#            perform irreversible operations"), which is not something to
+#            expose twice.
+#   kept:    Screenshot, Snapshot, Click, Type, Scroll, Move, Shortcut, Wait,
+#            WaitFor, App, DisplayInventory, Clipboard — the computer-use loop.
+# ControlStatus is force-retained by the server (keep.add("ControlStatus")), so
+# the allowlist yields 13 tools, not 12. It is the takeover/ownership readout.
+#
+# Measured on this machine (windows-mcp 0.8.8, Python 3.14.8, 2560x1440 x2):
+#   tools/list schema cost   11,036 B  ~= 2,759 tokens/request for 13 tools
+#   (full 21-tool set         16,297 B  ~= 4,074 tokens/request)
+#   cold start               2.27 s
+#   Screenshot               ~227 KB PNG, backend pillow
+#
+# Screenshot sizing — the part that is easy to get wrong:
+#   windows_mcp/desktop/service.py applies
+#       scale = min(WINDOWS_MCP_SCREENSHOT_SCALE, 1920/w, 1080/h)
+#   against a hardcoded MAX_IMAGE_WIDTH/HEIGHT of 1920x1080. On a 4480x1440
+#   virtual desktop the ceiling is 1080/1440 = 0.75, so values at or above that
+#   are all clamped to the same result. Measured: scale 1.0 -> 627 KB, 0.5 ->
+#   625 KB (identical, both clamped), 0.25 -> 230 KB (the only value that
+#   actually changes anything). 0.25 is used here because it is the only setting
+#   that measurably reduces the payload. Raise it if small UI text stops being
+#   legible; the returned "Coordinate Scale" line tells the model the factor to
+#   multiply image pixels by, so clicks stay accurate at any scale.
+#
+# ANONYMIZED_TELEMETRY: upstream defaults this ON and posts to PostHog.
+# WINDOWS_MCP_DISABLE_FLASH: without it every capture flashes an orange-red
+#   border across the screen.
+# PYTHONUTF8: forces UTF-8 stdio regardless of the machine's ANSI code page
+#   (this machine is 936), which matters because window titles and UI-tree text
+#   are Chinese here.
+- insert:
+    - id: windows-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: winmcp
+        transport: stdio
+        command: 'E:\conda-envs\wmcp314\python.exe'
+        args:
+          - '-m'
+          - 'windows_mcp'
+          - 'serve'
+          - '--tools'
+          - 'Screenshot,Snapshot,Click,Type,Scroll,Move,Shortcut,Wait,WaitFor,App,DisplayInventory,Clipboard'
+        env:
+          ANONYMIZED_TELEMETRY: 'false'
+          WINDOWS_MCP_DISABLE_FLASH: '1'
+          WINDOWS_MCP_SCREENSHOT_SCALE: '0.25'
+          PYTHONUTF8: '1'
+        # A UI-tree Snapshot can take several seconds on a busy desktop; the
+        # package default of 60 s is left generous on purpose rather than tight.
+        toolCallTimeoutMs: 120000
+        # Reject activation on a genuine connection/discovery failure. The
+        # interpreter and its dependencies are verified present, so a failure
+        # here means something really is wrong and should be loud.
+        failOnStartupError: true
+        reconnect:
+          enabled: true
